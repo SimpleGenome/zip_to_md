@@ -1,7 +1,7 @@
 import React from 'react';
-import './App.css'
+import './App.css';
 
-const { useEffect, useMemo, useState } = React;
+const { useEffect, useMemo, useRef, useState } = React;
 
 const BINARY_EXTENSIONS = new Set([
   "png",
@@ -46,6 +46,20 @@ const BINARY_EXTENSIONS = new Set([
   "ai",
   "sketch",
 ]);
+
+const DEFAULT_IGNORED_DIRECTORIES = [
+  "node_modules",
+  "npm_modules",
+  ".git",
+  "dist",
+  "build",
+  "coverage",
+  ".next",
+  "out",
+  "target",
+  ".turbo",
+  ".cache",
+];
 
 const EXTENSION_TO_LANGUAGE = {
   js: "javascript",
@@ -99,12 +113,47 @@ function normalizePath(path) {
     .replace(/\/$/, "");
 }
 
-function shouldSkipPath(path) {
-  return !path || path.startsWith("__MACOSX/") || path === ".DS_Store" || path.endsWith("/.DS_Store");
+function parseIgnoredDirectoryNames(input) {
+  return new Set(
+    String(input || "")
+      .split(",")
+      .map((value) => value.trim().toLowerCase())
+      .filter(Boolean)
+  );
+}
+
+function shouldSkipPath(path, ignoredDirectoryNames = new Set()) {
+  const normalized = normalizePath(path);
+  if (!normalized || normalized.startsWith("__MACOSX/") || normalized === ".DS_Store" || normalized.endsWith("/.DS_Store")) {
+    return true;
+  }
+
+  const parts = normalized.split("/").map((part) => part.toLowerCase());
+  return parts.some((part) => ignoredDirectoryNames.has(part));
 }
 
 function getBaseName(filename) {
   return String(filename || "repo").replace(/\.zip$/i, "") || "repo";
+}
+
+function sanitizeRepoName(name) {
+  return (
+    String(name || "repo")
+      .replace(/\.zip$/i, "")
+      .trim()
+      .replace(/[^a-z0-9-_]+/gi, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-+|-+$/g, "") || "repo"
+  );
+}
+
+function formatTimestamp(date = new Date()) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function buildDownloadName(repoName, date = new Date()) {
+  return `${formatTimestamp(date)}-${sanitizeRepoName(repoName)}.md`;
 }
 
 function getExtension(path) {
@@ -268,15 +317,25 @@ function renderTreeMarkdown(node, depth = 0) {
   return lines;
 }
 
-function buildMarkdown({ repoName, tree, files, binaryCount }) {
+function buildMarkdown({ repoName, tree, files, binaryCount, sourceKind, ignoredCount, ignoredDirectoryNames }) {
   const lines = [];
+  const ignoredList = Array.from(ignoredDirectoryNames);
 
   lines.push(`# ${repoName} Repository Export`);
   lines.push("");
-  lines.push("Generated from a ZIP upload on the client side.");
+  lines.push(
+    sourceKind === "folder"
+      ? "Generated from a local folder selection on the client side."
+      : "Generated from a ZIP upload on the client side."
+  );
   lines.push("");
   lines.push(`Total files: **${files.length}**`);
   lines.push("");
+
+  if (ignoredCount > 0) {
+    lines.push(`Ignored by folder rules: **${ignoredCount}** file(s) from directories such as ${ignoredList.join(", ")}.`);
+    lines.push("");
+  }
 
   if (binaryCount > 0) {
     lines.push(`Note: **${binaryCount}** binary/non-text file(s) are listed in the tree and included below as placeholders instead of raw bytes.`);
@@ -371,6 +430,34 @@ async function ensureJSZip() {
   throw lastError || new Error("Unable to load JSZip.");
 }
 
+function prepareDisplayEntries(rawEntries, fallbackRepoName, ignoredDirectoryNames) {
+  const filteredEntries = rawEntries.filter((item) => !shouldSkipPath(item.originalPath, ignoredDirectoryNames));
+
+  if (!filteredEntries.length) {
+    throw new Error("No files were found after applying the ignore rules.");
+  }
+
+  const normalizedPaths = filteredEntries.map((item) => item.originalPath);
+  const { rootPrefix, displayPaths } = stripCommonRoot(normalizedPaths);
+  const repoName = rootPrefix || getBaseName(fallbackRepoName);
+
+  return {
+    repoName,
+    ignoredCount: rawEntries.length - filteredEntries.length,
+    displayEntries: filteredEntries.map((item, index) => ({
+      ...item,
+      path: displayPaths[index],
+    })),
+  };
+}
+
+async function readItemBytes(item) {
+  if (item.entry) {
+    return item.entry.async("uint8array");
+  }
+  return new Uint8Array(await item.file.arrayBuffer());
+}
+
 function runSelfTests() {
   const tests = [];
 
@@ -379,7 +466,13 @@ function runSelfTests() {
   }
 
   try {
+    const ignoredDirectoryNames = parseIgnoredDirectoryNames(DEFAULT_IGNORED_DIRECTORIES.join(", "));
+
     addTest("normalizePath converts slashes", normalizePath("./a\\b//c/") === "a/b/c", normalizePath("./a\\b//c/"));
+    addTest("parseIgnoredDirectoryNames lowercases values", ignoredDirectoryNames.has("node_modules") && ignoredDirectoryNames.has("npm_modules"), JSON.stringify([...ignoredDirectoryNames]));
+    addTest("shouldSkipPath ignores nested node_modules", shouldSkipPath("repo/node_modules/react/index.js", ignoredDirectoryNames) === true, "node_modules should be ignored");
+    addTest("shouldSkipPath ignores nested npm_modules", shouldSkipPath("repo/npm_modules/pkg/index.js", ignoredDirectoryNames) === true, "npm_modules should be ignored");
+    addTest("shouldSkipPath keeps normal source files", shouldSkipPath("repo/src/index.js", ignoredDirectoryNames) === false, "src/index.js should not be ignored");
     addTest("stripCommonRoot removes single root folder", (() => {
       const result = stripCommonRoot(["repo/src/index.js", "repo/README.md"]);
       return result.rootPrefix === "repo" && result.displayPaths[0] === "src/index.js" && result.displayPaths[1] === "README.md";
@@ -397,12 +490,16 @@ function runSelfTests() {
     addTest("getFence expands for embedded backticks", getFence("aaa ``` bbb") === "````", getFence("aaa ``` bbb"));
     addTest("binary detection flags png", isLikelyText("image.png", new Uint8Array([137, 80, 78, 71])) === false, "png should be binary");
     addTest("text detection accepts utf8 text", isLikelyText("index.js", new TextEncoder().encode("console.log('hi');")) === true, "text should be detected");
+    addTest("buildDownloadName prepends local timestamp", buildDownloadName("web-game", new Date(2026, 2, 23, 11, 12)) === "20260323T11:12-web-game.md", buildDownloadName("web-game", new Date(2026, 2, 23, 11, 12)));
     addTest("markdown contains both sections", (() => {
       const tree = buildTree(["README.md"]);
       const md = buildMarkdown({
         repoName: "repo",
         tree,
         binaryCount: 0,
+        sourceKind: "folder",
+        ignoredCount: 0,
+        ignoredDirectoryNames,
         files: [{ path: "README.md", isText: true, content: "# Hello" }],
       });
       return md.includes("## 1. File Tree") && md.includes("## 2. File Contents") && md.includes("[README.md](#");
@@ -436,17 +533,33 @@ function StatBox({ label, value }) {
 }
 
 export default function RepoZipToMarkdownApp() {
+  const zipInputRef = useRef(null);
+  const folderInputRef = useRef(null);
+
+  const [sourceKind, setSourceKind] = useState("none");
+  const [sourceLabel, setSourceLabel] = useState("");
   const [zipFile, setZipFile] = useState(null);
+  const [folderFiles, setFolderFiles] = useState([]);
   const [markdown, setMarkdown] = useState("");
-  const [downloadName, setDownloadName] = useState("repo-export.md");
+  const [downloadName, setDownloadName] = useState(buildDownloadName("repo"));
   const [status, setStatus] = useState("Loading ZIP support...");
   const [error, setError] = useState("");
+  const [zipSupportError, setZipSupportError] = useState("");
   const [busy, setBusy] = useState(false);
   const [jsZipReady, setJsZipReady] = useState(false);
-  const [stats, setStats] = useState({ repoName: "—", totalFiles: 0, binaryFiles: 0 });
+  const [ignoreInput, setIgnoreInput] = useState(DEFAULT_IGNORED_DIRECTORIES.join(", "));
+  const [stats, setStats] = useState({
+    repoName: "—",
+    totalFiles: 0,
+    binaryFiles: 0,
+    ignoredFiles: 0,
+    sourceType: "—",
+  });
   const [selfTests] = useState(() => runSelfTests());
 
+  const ignoredDirectoryNames = useMemo(() => parseIgnoredDirectoryNames(ignoreInput), [ignoreInput]);
   const hasOutput = markdown.length > 0;
+  const hasSource = sourceKind === "zip" ? Boolean(zipFile) : folderFiles.length > 0;
   const passedTests = selfTests.filter((test) => test.pass).length;
 
   const previewStats = useMemo(() => {
@@ -463,12 +576,12 @@ export default function RepoZipToMarkdownApp() {
       .then(() => {
         if (cancelled) return;
         setJsZipReady(true);
-        setStatus("Upload a repo ZIP file to begin.");
+        setStatus("Ready. Choose a ZIP file or a local folder.");
       })
       .catch((err) => {
         if (cancelled) return;
-        setError(err?.message || "Unable to load ZIP support.");
-        setStatus("ZIP support could not be loaded.");
+        setZipSupportError(err?.message || "Unable to load ZIP support.");
+        setStatus("ZIP support could not be loaded, but folder export is still available.");
       });
 
     return () => {
@@ -476,23 +589,51 @@ export default function RepoZipToMarkdownApp() {
     };
   }, []);
 
-  function handleZipSelection(file) {
-    setZipFile(file || null);
+  function resetOutputState(nextRepoName) {
     setMarkdown("");
     setError("");
-    setStats({ repoName: "—", totalFiles: 0, binaryFiles: 0 });
-    setDownloadName(`${getBaseName(file?.name || "repo")}-export.md`);
-    setStatus(file ? `Ready to process: ${file.name}` : "Upload a repo ZIP file to begin.");
+    setStats({
+      repoName: "—",
+      totalFiles: 0,
+      binaryFiles: 0,
+      ignoredFiles: 0,
+      sourceType: "—",
+    });
+    setDownloadName(buildDownloadName(nextRepoName || "repo"));
+  }
+
+  function handleZipSelection(file) {
+    setSourceKind(file ? "zip" : "none");
+    setZipFile(file || null);
+    setFolderFiles([]);
+    const nextLabel = file?.name || "";
+    setSourceLabel(nextLabel);
+    resetOutputState(getBaseName(nextLabel || "repo"));
+    setStatus(file ? `Ready to process ZIP: ${file.name}` : "Ready. Choose a ZIP file or a local folder.");
+  }
+
+  function handleFolderSelection(fileList) {
+    const files = Array.from(fileList || []);
+    setSourceKind(files.length ? "folder" : "none");
+    setZipFile(null);
+    setFolderFiles(files);
+
+    const firstRelativePath = normalizePath(files[0]?.webkitRelativePath || files[0]?.name || "repo");
+    const guessedRepoName = firstRelativePath.includes("/") ? firstRelativePath.split("/")[0] : getBaseName(firstRelativePath);
+
+    setSourceLabel(guessedRepoName);
+    resetOutputState(guessedRepoName);
+    setStatus(files.length ? `Ready to process folder: ${guessedRepoName} (${files.length} file${files.length === 1 ? "" : "s"} selected)` : "Ready. Choose a ZIP file or a local folder.");
   }
 
   async function generateMarkdown() {
-    if (!zipFile) {
-      setError("Please choose a ZIP file first.");
+    if (!hasSource) {
+      setError("Please choose a ZIP file or a local folder first.");
       return;
     }
 
-    if (!jsZipReady || !window.JSZip) {
-      setError("ZIP library is not ready yet. Please try again in a moment.");
+    if (sourceKind === "zip" && (!jsZipReady || !window.JSZip)) {
+      setError("ZIP library is not ready yet. Try folder mode, or wait for ZIP support to finish loading.");
       return;
     }
 
@@ -501,31 +642,32 @@ export default function RepoZipToMarkdownApp() {
     setMarkdown("");
 
     try {
-      setStatus("Reading ZIP file...");
-      const zip = await window.JSZip.loadAsync(zipFile);
+      let prepared;
 
-      const fileEntries = Object.values(zip.files)
-        .filter((entry) => !entry.dir)
-        .map((entry) => ({
-          entry,
-          originalPath: normalizePath(entry.name),
-        }))
-        .filter(({ originalPath }) => !shouldSkipPath(originalPath));
+      if (sourceKind === "zip") {
+        setStatus("Reading ZIP file...");
+        const zip = await window.JSZip.loadAsync(zipFile);
 
-      if (!fileEntries.length) {
-        throw new Error("No files were found in that ZIP archive.");
+        const rawEntries = Object.values(zip.files)
+          .filter((entry) => !entry.dir)
+          .map((entry) => ({
+            entry,
+            originalPath: normalizePath(entry.name),
+          }));
+
+        prepared = prepareDisplayEntries(rawEntries, zipFile.name, ignoredDirectoryNames);
+      } else {
+        setStatus("Reading local folder...");
+        const rawEntries = folderFiles.map((file) => ({
+          file,
+          originalPath: normalizePath(file.webkitRelativePath || file.name),
+        }));
+
+        prepared = prepareDisplayEntries(rawEntries, sourceLabel || "repo", ignoredDirectoryNames);
       }
 
-      const normalizedPaths = fileEntries.map(({ originalPath }) => originalPath);
-      const { rootPrefix, displayPaths } = stripCommonRoot(normalizedPaths);
-      const repoName = rootPrefix || getBaseName(zipFile.name);
-
-      const displayEntries = fileEntries.map((item, index) => ({
-        entry: item.entry,
-        path: displayPaths[index],
-      }));
-
-      const pathToEntry = new Map(displayEntries.map((item) => [item.path, item.entry]));
+      const { repoName, ignoredCount, displayEntries } = prepared;
+      const pathToItem = new Map(displayEntries.map((item) => [item.path, item]));
       const tree = buildTree(displayEntries.map((item) => item.path));
       const orderedPaths = collectFilesInTreeOrder(tree);
       const files = [];
@@ -533,33 +675,56 @@ export default function RepoZipToMarkdownApp() {
 
       for (let i = 0; i < orderedPaths.length; i += 1) {
         const path = orderedPaths[i];
-        const entry = pathToEntry.get(path);
-        if (!entry) continue;
+        const item = pathToItem.get(path);
+        if (!item) continue;
 
         setStatus(`Reading files ${i + 1} of ${orderedPaths.length}...`);
 
-        const bytes = await entry.async("uint8array");
+        const bytes = await readItemBytes(item);
         const isText = isLikelyText(path, bytes);
         const content = isText ? decodeText(bytes) : "";
 
         if (!isText) binaryCount += 1;
-
         files.push({ path, isText, content });
       }
 
       setStatus("Building Markdown document...");
-      const output = buildMarkdown({ repoName, tree, files, binaryCount });
+      const output = buildMarkdown({
+        repoName,
+        tree,
+        files,
+        binaryCount,
+        sourceKind,
+        ignoredCount,
+        ignoredDirectoryNames,
+      });
 
+      const nextDownloadName = buildDownloadName(repoName);
       setMarkdown(output);
-      setStats({ repoName, totalFiles: files.length, binaryFiles: binaryCount });
-      setDownloadName(`${repoName.replace(/[^a-z0-9-_]+/gi, "-") || "repo"}-export.md`);
+      setStats({
+        repoName,
+        totalFiles: files.length,
+        binaryFiles: binaryCount,
+        ignoredFiles: ignoredCount,
+        sourceType: sourceKind === "folder" ? "Folder" : "ZIP",
+      });
+      setDownloadName(nextDownloadName);
       setStatus("Done. Your Markdown file is ready to preview, copy, or download.");
     } catch (err) {
-      setError(err?.message || "Something went wrong while processing the ZIP file.");
+      setError(err?.message || "Something went wrong while processing the selected source.");
       setStatus("Unable to generate the Markdown file.");
     } finally {
       setBusy(false);
     }
+  }
+
+  function handleDownload() {
+    if (!markdown) return;
+    const repoName = stats.repoName !== "—" ? stats.repoName : getBaseName(sourceLabel || "repo");
+    const filename = buildDownloadName(repoName);
+    setDownloadName(filename);
+    downloadTextFile(filename, markdown);
+    setStatus(`Downloaded ${filename}`);
   }
 
   async function copyMarkdown() {
@@ -575,7 +740,9 @@ export default function RepoZipToMarkdownApp() {
   function onDrop(event) {
     event.preventDefault();
     const file = event.dataTransfer.files?.[0];
-    if (file) handleZipSelection(file);
+    if (file) {
+      handleZipSelection(file);
+    }
   }
 
   function onDragOver(event) {
@@ -586,45 +753,74 @@ export default function RepoZipToMarkdownApp() {
     <div className="min-h-screen bg-slate-50 p-6 text-slate-900">
       <div className="mx-auto flex max-w-6xl flex-col gap-6">
         <div className="space-y-2">
-          <h1 className="text-3xl font-semibold tracking-tight">Repo ZIP to Linked Markdown Export</h1>
+          <h1 className="text-3xl font-semibold tracking-tight">Repo ZIP or Folder to Linked Markdown Export</h1>
           <p className="max-w-3xl text-sm text-slate-600">
-            Upload a repository ZIP, generate a Markdown file with a linked file tree and every file printed in the same order,
-            then save the result locally.
+            Choose a repository ZIP or use the browser&apos;s folder picker for a local repo folder, generate a Markdown file with a linked file tree,
+            ignore folders like node_modules, and save the result locally with a timestamped filename.
           </p>
         </div>
 
         <div className="grid gap-6 lg:grid-cols-[1.1fr_0.9fr]">
-          <SectionCard title="Upload ZIP" subtitle="No build-time package imports. JSZip loads dynamically at runtime.">
+          <SectionCard title="Select Source" subtitle="ZIP upload and local folder export are both supported in the browser.">
             <div className="space-y-4">
-              <label
+              <input
+                ref={zipInputRef}
+                type="file"
+                accept=".zip,application/zip"
+                className="hidden"
+                onChange={(event) => {
+                  handleZipSelection(event.target.files?.[0] || null);
+                  event.target.value = "";
+                }}
+              />
+              <input
+                ref={folderInputRef}
+                type="file"
+                multiple
+                webkitdirectory=""
+                directory=""
+                className="hidden"
+                onChange={(event) => {
+                  handleFolderSelection(event.target.files || []);
+                  event.target.value = "";
+                }}
+              />
+
+              <div
                 onDrop={onDrop}
                 onDragOver={onDragOver}
-                className="flex min-h-40 cursor-pointer flex-col items-center justify-center rounded-3xl border border-dashed border-slate-300 bg-white p-6 text-center transition hover:border-slate-400 hover:bg-slate-50"
+                className="flex min-h-40 flex-col items-center justify-center rounded-3xl border border-dashed border-slate-300 bg-white p-6 text-center"
               >
-                <input
-                  type="file"
-                  accept=".zip,application/zip"
-                  className="hidden"
-                  onChange={(event) => handleZipSelection(event.target.files?.[0] || null)}
-                />
                 <div className="mb-3 rounded-full bg-slate-100 px-4 py-3 text-lg">📦</div>
-                <div className="text-sm font-medium">Drop a ZIP here or click to browse</div>
+                <div className="text-sm font-medium">Drop a ZIP here, or choose a ZIP or folder below</div>
                 <div className="mt-1 text-xs text-slate-500">
-                  Best for source repos. Binary files are listed and included as placeholders.
+                  Folder mode uses the browser&apos;s local directory picker. Ignore rules apply to both ZIP and folder mode.
                 </div>
-                {zipFile ? <div className="mt-4 rounded-full bg-slate-900 px-3 py-1 text-xs text-white">{zipFile.name}</div> : null}
-              </label>
+                {sourceLabel ? <div className="mt-4 rounded-full bg-slate-900 px-3 py-1 text-xs text-white">{sourceLabel}</div> : null}
+              </div>
 
               <div className="flex flex-wrap gap-3">
                 <button
+                  onClick={() => zipInputRef.current?.click()}
+                  className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white"
+                >
+                  Choose ZIP
+                </button>
+                <button
+                  onClick={() => folderInputRef.current?.click()}
+                  className="rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-900"
+                >
+                  Choose Folder
+                </button>
+                <button
                   onClick={generateMarkdown}
-                  disabled={!zipFile || busy || !jsZipReady}
-                  className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={!hasSource || busy || (sourceKind === "zip" && !jsZipReady)}
+                  className="rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   {busy ? "Working..." : "Generate Markdown"}
                 </button>
                 <button
-                  onClick={() => downloadTextFile(downloadName, markdown)}
+                  onClick={handleDownload}
                   disabled={!hasOutput || busy}
                   className="rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
                 >
@@ -639,9 +835,26 @@ export default function RepoZipToMarkdownApp() {
                 </button>
               </div>
 
+              <div className="space-y-2 rounded-2xl bg-slate-100 p-4 text-sm text-slate-700">
+                <label className="block font-medium" htmlFor="ignore-input">
+                  Ignored folders
+                </label>
+                <input
+                  id="ignore-input"
+                  value={ignoreInput}
+                  onChange={(event) => setIgnoreInput(event.target.value)}
+                  placeholder="node_modules, npm_modules, .git"
+                  className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm outline-none"
+                />
+                <div className="text-xs text-slate-500">
+                  Any matching directory name is skipped anywhere in the tree.
+                </div>
+              </div>
+
               <div className="rounded-2xl bg-slate-100 p-4 text-sm text-slate-700">
                 <div className="font-medium">Status</div>
                 <div className="mt-1">{status}</div>
+                {zipSupportError ? <div className="mt-3 text-sm text-amber-700">ZIP support note: {zipSupportError}</div> : null}
                 {error ? <div className="mt-3 text-sm text-red-600">{error}</div> : null}
               </div>
             </div>
@@ -650,7 +863,9 @@ export default function RepoZipToMarkdownApp() {
           <SectionCard title="Export Summary" subtitle="Updated after generation.">
             <div className="grid grid-cols-2 gap-3">
               <StatBox label="Repository" value={stats.repoName} />
+              <StatBox label="Source type" value={stats.sourceType} />
               <StatBox label="Files" value={stats.totalFiles} />
+              <StatBox label="Ignored files" value={stats.ignoredFiles} />
               <StatBox label="Binary placeholders" value={stats.binaryFiles} />
               <StatBox label="Download name" value={downloadName} />
             </div>
@@ -678,7 +893,7 @@ export default function RepoZipToMarkdownApp() {
           />
         </SectionCard>
 
-        <SectionCard title="Built-in Tests" subtitle="These check core path, tree-order, anchor, fence, text-detection, and markdown-generation logic.">
+        <SectionCard title="Built-in Tests" subtitle="These check path filtering, folder ignore rules, timestamped filenames, tree order, anchors, text detection, and markdown generation.">
           <div className="space-y-2">
             {selfTests.map((test, index) => (
               <div
